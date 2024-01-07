@@ -162,6 +162,7 @@ func NewAPIServer(config *APIConfig) (http.Handler, error) {
 
 	// SSO validation handlers
 	srv.POST("/:version/github/requests/validate", srv.WithAuth(srv.validateGithubAuthCallback))
+	srv.POST("/:version/oidc/requests/validate", srv.WithAuth(srv.validateOIDCAuthCallback))
 
 	// Audit logs AKA events
 	srv.GET("/:version/events", srv.WithAuth(srv.searchEvents))
