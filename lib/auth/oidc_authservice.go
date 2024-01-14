@@ -18,11 +18,15 @@ import (
 	"github.com/gravitational/trace"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/oauth2"
+	"io"
+	"net/http"
 	"net/url"
 	"slices"
+	"strings"
 )
 
 var ErrOIDCNoRoles = trace.BadParameter("user does not belong to any groups configured in oidc role map")
+var ExternalSkippedClaims = []string{"azp", "nonce", "state", "at_hash", "iss", "jti", "session_state", "typ", "aud", "acr"}
 
 type OIDCAuthService struct {
 	s *Server
@@ -42,7 +46,15 @@ func (a *OIDCAuthService) CreateOIDCAuthRequest(ctx context.Context, req types.O
 
 	redirectURL, err := services.GetRedirectURL(connector, a.s.getProxyPublicAddr())
 
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
 	p, err := oidc.NewProvider(ctx, connector.GetIssuerURL())
+
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
 
 	oauthConfig := oauth2.Config{
 		ClientID:     connector.GetClientID(),
@@ -203,8 +215,33 @@ func (a *OIDCAuthService) validateOIDCAuthCallback(ctx context.Context, diagCtx 
 	}
 
 	var rawClaims RawIDTokenClaims
-	if err := idToken.Claims(&rawClaims); err != nil {
+	if err = idToken.Claims(&rawClaims); err != nil {
 		return nil, trace.Wrap(err, fmt.Sprintf("Failed to extract id token claims: %s", err))
+	}
+
+	// Check for distributed claims
+	distributedClaims, hasDistribClaims := rawClaims["_claim_names"].(map[string]string)
+	claimSources, hasClaimSources := rawClaims["_claim_sources"].(map[string]interface{})
+	if hasDistribClaims && hasClaimSources {
+		log.WithFields(logrus.Fields{trace.Component: "oidc"}).Debugf("ID Token has distributed claims - resolving")
+		for distribClaimName, distribClaimSourceName := range distributedClaims {
+			claimSource, sourceExists := claimSources[distribClaimSourceName].(map[string]interface{})
+			if sourceExists {
+				endpoint, epe := claimSource["endpoint"].(string)
+				accessToken := claimSource["access_token"].(string)
+
+				if epe {
+					claims, err := resolveDistributedClaim(ctx, verifier, endpoint, accessToken)
+
+					if err == nil {
+						log.WithFields(logrus.Fields{trace.Component: "oidc"}).Debugf("Resolved distributed claims %v", claims)
+						rawClaims[distribClaimName] = claims
+					} else {
+						log.WithFields(logrus.Fields{trace.Component: "oidc"}).Debugf("Failed to resolve distributed claims %v", err)
+					}
+				}
+			}
+		}
 	}
 
 	username, ok := rawClaims["preferred_username"].(string)
@@ -316,8 +353,8 @@ func (a *Server) calculateOIDCUser(ctx context.Context, diagCtx *SSODiagContext,
 
 	for _, claimMap := range claimToRoles {
 
-		v, ok := claims[claimMap.Claim].(string)
-		if ok {
+		v, stringOK := claims[claimMap.Claim].(string)
+		if stringOK {
 			if v == claimMap.Value {
 				for _, r := range claimMap.Roles {
 					if !slices.Contains(p.Roles, r) {
@@ -327,8 +364,8 @@ func (a *Server) calculateOIDCUser(ctx context.Context, diagCtx *SSODiagContext,
 			}
 		}
 
-		vs, ok := claims[claimMap.Claim].([]interface{})
-		if ok {
+		vs, mapOK := claims[claimMap.Claim].([]interface{})
+		if mapOK {
 			for _, claimVal := range vs {
 				claimValString, claimValIsString := claimVal.(string)
 				if claimValIsString {
@@ -344,13 +381,48 @@ func (a *Server) calculateOIDCUser(ctx context.Context, diagCtx *SSODiagContext,
 		}
 	}
 
+	var loginTrait = username
+	if at := strings.LastIndex(username, "@"); at >= 0 {
+		loginTrait = username[at:]
+	}
+
 	if len(p.Roles) == 0 {
+		log.WithFields(logrus.Fields{trace.Component: "oidc"}).Debugf("Couldn't retrieve OIDC roles from claims: %v", claims)
 		return nil, trace.Wrap(ErrOIDCNoRoles)
 	}
 	p.Traits = map[string][]string{
-		constants.TraitLogins:     {p.Username},
-		constants.TraitKubeGroups: p.KubeGroups,
-		constants.TraitKubeUsers:  p.KubeUsers,
+		constants.TraitLogins:        {loginTrait},
+		constants.TraitWindowsLogins: {loginTrait},
+		constants.TraitKubeGroups:    p.KubeGroups,
+		constants.TraitKubeUsers:     p.KubeUsers,
+	}
+
+	for claimName, claim := range claims {
+
+		if slices.Contains(ExternalSkippedClaims, claimName) {
+			continue
+		}
+
+		v, stringOK := claim.(string)
+		if stringOK {
+			//p.Traits[fmt.Sprintf("%s.%s", teleport.TraitExternalPrefix, claimName)] = []string{v}
+			p.Traits[claimName] = []string{v}
+			continue
+		}
+
+		vm, mapOK := claim.([]interface{})
+		if mapOK {
+			var stringSlice []string
+			for _, claimVal := range vm {
+				v, stringOK = claimVal.(string)
+				if stringOK {
+					stringSlice = append(stringSlice, v)
+				}
+			}
+
+			//p.Traits[fmt.Sprintf("%s.%s", teleport.TraitExternalPrefix, claimName)] = stringSlice
+			p.Traits[claimName] = stringSlice
+		}
 	}
 
 	evaluationInput := &loginrule.EvaluationInput{
@@ -452,4 +524,47 @@ func OIDCAuthRequestFromProto(req *types.OIDCAuthRequest) OIDCAuthRequest {
 		CreateWebSession:  req.CreateWebSession,
 		ClientRedirectURL: req.ClientRedirectURL,
 	}
+}
+
+func resolveDistributedClaim(ctx context.Context, verifier *oidc.IDTokenVerifier, endpoint string, accessToken string) (RawIDTokenClaims, error) {
+	req, err := http.NewRequest("GET", endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("malformed request: %v", err)
+	}
+	if accessToken != "" {
+		req.Header.Set("Authorization", "Bearer "+accessToken)
+	}
+
+	client, ok := ctx.Value(oauth2.HTTPClient).(*http.Client)
+
+	if !ok {
+		return nil, fmt.Errorf("could not retrieve http client: %v", err)
+	}
+
+	resp, err := client.Do(req.WithContext(ctx))
+	if err != nil {
+		return nil, fmt.Errorf("oidc: Request to endpoint failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("unable to read response body: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("oidc: request failed: %v", resp.StatusCode)
+	}
+
+	token, err := verifier.Verify(ctx, string(body))
+	if err != nil {
+		return nil, fmt.Errorf("malformed response body: %v", err)
+	}
+
+	var rawClaims RawIDTokenClaims
+	if err := token.Claims(&rawClaims); err != nil {
+		return nil, fmt.Errorf("failed to extract token claims: %v", err)
+	}
+
+	return rawClaims, nil
 }
